@@ -18,7 +18,8 @@ from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+_TW = timezone(timedelta(hours=8))
 import os, re, pathlib, requests
 from dotenv import load_dotenv
 
@@ -298,6 +299,15 @@ def _notion_upload_image(img_url: str, headers: dict):
         return None
 
 
+def _make_title(t: str, limit: int = 40) -> str:
+    import re as _re
+    for line in (t or "").splitlines():
+        line = _re.sub(r"\s+", " ", line).strip(" -—⬇️👇#")
+        if line and not line.startswith("#"):
+            return line if len(line) <= limit else line[:limit].rstrip() + "…"
+    return (t or "")[:limit] or "未命名"
+
+
 # ---------- Notion ----------
 def save_notion(data, platform, url):
     # Raw HTTP against the 2025-09-03 API: databases created under the new
@@ -329,11 +339,23 @@ def save_notion(data, platform, url):
             parent = {"data_source_id": ds_id}
     names = set(schema.keys())
     text = (data.get("caption") or data.get("content") or data.get("description") or "")
-    title_text = (data.get("title") or text or url)[:200]
+    title_text = _make_title(data.get("title") or text or url)
     cover_url = data.get("og_image") or next(
-        (m.get("url") for m in data.get("media", []) if isinstance(m, dict) and m.get("url")), None)
+        (m.get("url") for m in data.get("media", [])
+         if isinstance(m, dict) and m.get("url") and m.get("kind", "image") != "video"), None)
+    ts = data.get("timestamp")
+    try:
+        post_date = datetime.fromtimestamp(int(ts), _TW).date().isoformat() if ts else datetime.now(_TW).date().isoformat()
+    except Exception:
+        post_date = datetime.now(_TW).date().isoformat()
+    # upload every image once; reuse the first as the cover
+    uploaded = {}
+    def _fid(u):
+        if u not in uploaded:
+            uploaded[u] = _notion_upload_image(u, headers)
+        return uploaded[u]
+    cover_fid = _notion_upload_image(cover_url, headers) if cover_url else None  # separate upload for the property
     props = {}
-    now_iso = datetime.now().isoformat()
     if "URL" in names:  # V3 English schema
         props["URL"] = {"title": [{"text": {"content": url}}]}
         if "Platform" in names:
@@ -347,7 +369,7 @@ def save_notion(data, platform, url):
         if "FullContent" in names and data.get("content"):
             props["FullContent"] = {"rich_text": [{"text": {"content": data["content"][:1900]}}]}
         if "PostDate" in names:
-            props["PostDate"] = {"date": {"start": now_iso}}
+            props["PostDate"] = {"date": {"start": post_date}}
     elif "名稱" in names:  # Existing Kai 收藏庫 schema
         props["名稱"] = {"title": [{"text": {"content": title_text}}]}
         if "作者" in names:
@@ -359,48 +381,71 @@ def save_notion(data, platform, url):
             if platform in plat_map:  # X / Web options don't exist in that DB; skip instead of failing
                 props["平台"] = {"select": {"name": plat_map[platform]}}
         if "封面" in names and cover_url:
-            props["封面"] = {"files": [{"name": "cover", "external": {"url": cover_url}}]}
+            if cover_fid:
+                props["封面"] = {"files": [{"name": "cover", "type": "file_upload", "file_upload": {"id": cover_fid}}]}
+            else:
+                props["封面"] = {"files": [{"name": "cover", "external": {"url": cover_url}}]}
         if "建立時間" in names:
-            props["建立時間"] = {"date": {"start": now_iso}}
+            props["建立時間"] = {"date": {"start": post_date}}
         if "狀態" in names:
             props["狀態"] = {"select": {"name": "未整理"}}
         if "標籤" in names:
             props["標籤"] = {"multi_select": [{"name": "收藏"}]}
     else:
         raise RuntimeError(f"Unrecognised Notion schema: {sorted(names)}")
-    # Full text as page blocks (Notion rich_text props cap at 2000 chars)
+    # ----- page body: 貼文內容 / 引用 / 圖片 / 來源 -----
+    def _rt(t, link=None):
+        d = {"type": "text", "text": {"content": t[:1900]}}
+        if link:
+            d["text"]["link"] = {"url": link}
+        return [d]
+    def _h(t):
+        return {"object": "block", "type": "heading_2", "heading_2": {"rich_text": _rt(t)}}
+    def _paras(t, kind="paragraph"):
+        out = []
+        for chunk in [c.strip() for c in t.split("\n\n") if c.strip()]:
+            for i in range(0, len(chunk), 1900):
+                out.append({"object": "block", "type": kind, kind: {"rich_text": _rt(chunk[i:i+1900])}})
+        return out
     children = []
-    if text:
-        for i in range(0, min(len(text), 16000), 1900):
-            children.append({"object": "block", "type": "paragraph",
-                             "paragraph": {"rich_text": [{"type": "text", "text": {"content": text[i:i+1900]}}]}})
-    # All collected media: images as image blocks, videos as link paragraphs
-    seen_media = set()
+    main_text, quoted = text, []
+    if "—— 引用 @" in text:
+        parts = text.split("—— 引用 @")
+        main_text = parts[0].strip()
+        for q in parts[1:]:
+            head, _, rest = q.partition("——")
+            quoted.append((head.strip(), rest.strip()))
+    if main_text:
+        children.append(_h("貼文內容"))
+        children += _paras(main_text)
+    for who, qt in quoted:
+        children.append(_h(f"引用 @{who}"))
+        children += _paras(qt, "quote")
+    imgs, vids, seen_media = [], [], set()
     for m in data.get("media", []):
-        if isinstance(m, dict):
-            mu, mkind = m.get("url"), m.get("kind", "image")
-        else:
-            mu, mkind = m, "image"
+        mu, mkind = (m.get("url"), m.get("kind", "image")) if isinstance(m, dict) else (m, "image")
         if not mu or mu in seen_media:
             continue
         seen_media.add(mu)
-        if mkind == "video":
-            children.append({"object": "block", "type": "paragraph",
-                             "paragraph": {"rich_text": [{"type": "text",
-                                "text": {"content": f"影片：{mu}", "link": {"url": mu}}}]}})
-        else:
-            fid = _notion_upload_image(mu, headers)
+        (vids if mkind == "video" else imgs).append(mu)
+    if imgs:
+        children.append(_h(f"圖片（{len(imgs)}）"))
+        for mu in imgs[:20]:
+            fid = _fid(mu)
             if fid:
                 children.append({"object": "block", "type": "image",
                                  "image": {"type": "file_upload", "file_upload": {"id": fid}}})
             else:
                 children.append({"object": "block", "type": "image",
                                  "image": {"type": "external", "external": {"url": mu}}})
-        if len(seen_media) >= 20:
-            break
+    if vids:
+        children.append(_h("影片"))
+        for i, mu in enumerate(vids[:10], 1):
+            children.append({"object": "block", "type": "paragraph",
+                             "paragraph": {"rich_text": _rt(f"影片 {i}", mu)}})
+    children.append({"object": "block", "type": "divider", "divider": {}})
     children.append({"object": "block", "type": "paragraph",
-                     "paragraph": {"rich_text": [{"type": "text",
-                        "text": {"content": f"來源：{url}", "link": {"url": url}}}]}})
+                     "paragraph": {"rich_text": [{"type": "text", "text": {"content": "來源："}}] + _rt(url, url)}})
     resp = _rq.post("https://api.notion.com/v1/pages", headers=headers,
                     json={"parent": parent, "properties": props,
                           "children": children[:100]}, timeout=30)
