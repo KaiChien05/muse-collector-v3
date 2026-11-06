@@ -121,6 +121,100 @@ def extract_with_apify_or_ytdlp(url: str):
                 "source": "none", "error": str(e)}
 
 
+
+# ---------- Threads page parser (gets carousels, linked/quoted posts, self-thread) ----------
+_GOOGLEBOT_UA = "Googlebot/2.1 (+http://www.google.com/bot.html)"
+
+
+def _threads_code(url: str):
+    import re as _re
+    m = _re.search(r"/post/([A-Za-z0-9_-]+)", url)
+    return m.group(1) if m else None
+
+
+def _post_media(p: dict):
+    out = []
+    items = p.get("carousel_media") or [p]
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        vids = it.get("video_versions") or []
+        if vids and vids[0].get("url"):
+            out.append({"url": vids[0]["url"], "kind": "video"})
+            continue
+        cands = (it.get("image_versions2") or {}).get("candidates") or []
+        if cands and cands[0].get("url"):
+            best = max(cands, key=lambda c: (c.get("width") or 0) * (c.get("height") or 0))
+            out.append({"url": best["url"], "kind": "image"})
+    return out
+
+
+def extract_threads_html(url: str):
+    """Read the public Threads post page and pull caption + every image/video,
+    including a linked/quoted post (e.g. a post that embeds another post's
+    10-image carousel) and the author's own follow-up posts in the thread."""
+    import json as _json, re as _re
+    code = _threads_code(url)
+    r = requests.get(url, timeout=20, headers={"User-Agent": _GOOGLEBOT_UA, "Accept-Language": "zh-TW,zh;q=0.9"})
+    r.raise_for_status()
+    final_code = _threads_code(r.url) or code
+    blobs = _re.findall(r'<script type="application/json"[^>]*>(.*?)</script>', r.text, _re.S)
+    posts = {}
+
+    def walk(o):
+        if isinstance(o, dict):
+            c = o.get("code")
+            if c and isinstance(o.get("user"), dict) and ("carousel_media" in o or "image_versions2" in o):
+                if c not in posts or len(_json.dumps(o)) > len(_json.dumps(posts[c])):
+                    posts[c] = o
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+
+    for b in blobs:
+        if final_code and final_code not in b:
+            continue
+        try:
+            walk(_json.loads(b))
+        except Exception:
+            pass
+    main = posts.get(final_code)
+    if not main:
+        return None
+    author = main["user"].get("username") or "unknown"
+    texts = [((main.get("caption") or {}).get("text") or "")]
+    media = _post_media(main)
+    info = main.get("text_post_app_info") or {}
+    share = info.get("share_info") or {}
+    for linked in (info.get("linked_inline_media"), share.get("quoted_post"),
+                   share.get("quoted_attachment_post"), share.get("reposted_post")):
+        if isinstance(linked, dict):
+            lt = (linked.get("caption") or {}).get("text") or ""
+            lu = (linked.get("user") or {}).get("username") or ""
+            if lt:
+                texts.append(f"—— 引用 @{lu} ——\n{lt}")
+            media += _post_media(linked)
+    # author's own follow-ups in the same thread
+    for c, p in posts.items():
+        if c == final_code or (p.get("user") or {}).get("username") != author:
+            continue
+        pi = p.get("text_post_app_info") or {}
+        if pi.get("is_reply") and ((pi.get("reply_to_author") or {}).get("username") == author):
+            t = (p.get("caption") or {}).get("text") or ""
+            if t:
+                texts.append(t)
+            media += _post_media(p)
+    seen, uniq = set(), []
+    for m in media:
+        if m["url"] not in seen:
+            seen.add(m["url"])
+            uniq.append(m)
+    return {"author": author, "caption": "\n\n".join(t for t in texts if t),
+            "media": uniq, "timestamp": main.get("taken_at"), "source": "threads-html"}
+
+
 def extract_web(url: str):
     try:
         import trafilatura
@@ -178,6 +272,30 @@ def save_obsidian(data, platform, url):
     out_path.write_text(md, encoding="utf-8")
     return {"note": f"generated {fname} at {out_path} (no OBSIDIAN_API_URL set; file is ephemeral on the host)",
             "filename": fname, "obsidian_markdown": md[:8000]}
+
+
+def _notion_upload_image(img_url: str, headers: dict):
+    """Copy an image into Notion (File Upload API) so it never expires.
+    Returns the file_upload id, or None to fall back to an external link."""
+    import requests as _rq
+    try:
+        g = _rq.get(img_url, timeout=30, headers={"User-Agent": _GOOGLEBOT_UA})
+        g.raise_for_status()
+        ctype = g.headers.get("Content-Type", "image/jpeg").split(";")[0]
+        ext = {"image/png": "png", "image/webp": "webp", "image/gif": "gif"}.get(ctype, "jpg")
+        name = f"image.{ext}"
+        h = {k: v for k, v in headers.items() if k.lower() != "content-type"}
+        c = _rq.post("https://api.notion.com/v1/file_uploads", headers=headers,
+                     json={"filename": name, "content_type": ctype}, timeout=30)
+        c.raise_for_status()
+        fid = c.json()["id"]
+        s = _rq.post(f"https://api.notion.com/v1/file_uploads/{fid}/send", headers=h,
+                     files={"file": (name, g.content, ctype)}, timeout=60)
+        s.raise_for_status()
+        return fid
+    except Exception as e:
+        print(f"Notion upload failed, using external url: {e}")
+        return None
 
 
 # ---------- Notion ----------
@@ -271,8 +389,13 @@ def save_notion(data, platform, url):
                              "paragraph": {"rich_text": [{"type": "text",
                                 "text": {"content": f"影片：{mu}", "link": {"url": mu}}}]}})
         else:
-            children.append({"object": "block", "type": "image",
-                             "image": {"type": "external", "external": {"url": mu}}})
+            fid = _notion_upload_image(mu, headers)
+            if fid:
+                children.append({"object": "block", "type": "image",
+                                 "image": {"type": "file_upload", "file_upload": {"id": fid}}})
+            else:
+                children.append({"object": "block", "type": "image",
+                                 "image": {"type": "external", "external": {"url": mu}}})
         if len(seen_media) >= 20:
             break
     children.append({"object": "block", "type": "paragraph",
@@ -293,6 +416,15 @@ def run_collect(url: str, destination: str, force_platform: str | None = None):
         raise HTTPException(status_code=400, detail=f"destination must be one of {DESTINATIONS}")
     platform = force_platform or detect_platform(url)
     data = extract_web(url) if platform == "Web" else extract_with_apify_or_ytdlp(url)
+    if platform == "Threads":
+        try:
+            h = extract_threads_html(url)
+            if h and (len(h["media"]) > len(data.get("media") or []) or len(h["caption"]) > len(data.get("caption") or "")):
+                if not h["media"]:
+                    h["media"] = data.get("media") or []
+                data = h
+        except Exception as e:
+            print(f"Threads HTML parse failed: {e}")
     data["platform"] = platform
     data["url"] = url
     results = {}
