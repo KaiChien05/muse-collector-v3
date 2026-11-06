@@ -162,12 +162,33 @@ def save_obsidian(data, platform, url):
 
 # ---------- Notion ----------
 def save_notion(data, platform, url):
-    from notion_client import Client
-    notion = Client(auth=os.getenv("NOTION_TOKEN"))
+    # Raw HTTP against the 2025-09-03 API: databases created under the new
+    # data-source model return no properties from databases.retrieve, so the
+    # schema is read from the database's first data source and the page is
+    # created with a data_source_id parent.
+    import requests as _rq
+    token = os.getenv("NOTION_TOKEN")
     db_id = os.getenv("NOTION_DATABASE_ID")
+    if not token:
+        raise RuntimeError("NOTION_TOKEN not set")
     if not db_id:
         raise RuntimeError("NOTION_DATABASE_ID not set")
-    schema = notion.databases.retrieve(database_id=db_id).get("properties", {})
+    headers = {"Authorization": f"Bearer {token}",
+               "Notion-Version": "2025-09-03",
+               "Content-Type": "application/json"}
+    r = _rq.get(f"https://api.notion.com/v1/databases/{db_id}", headers=headers, timeout=30)
+    r.raise_for_status()
+    db = r.json()
+    schema = db.get("properties", {}) or {}
+    parent = {"database_id": db_id}
+    if db.get("data_sources"):
+        ds_id = db["data_sources"][0]["id"]
+        r2 = _rq.get(f"https://api.notion.com/v1/data_sources/{ds_id}", headers=headers, timeout=30)
+        r2.raise_for_status()
+        ds_schema = r2.json().get("properties", {}) or {}
+        if ds_schema:
+            schema = ds_schema
+            parent = {"data_source_id": ds_id}
     names = set(schema.keys())
     text = (data.get("caption") or data.get("content") or data.get("description") or "")
     title_text = (data.get("title") or text or url)[:200]
@@ -218,8 +239,12 @@ def save_notion(data, platform, url):
     children.append({"object": "block", "type": "paragraph",
                      "paragraph": {"rich_text": [{"type": "text",
                         "text": {"content": f"來源：{url}", "link": {"url": url}}}]}})
-    page = notion.pages.create(parent={"database_id": db_id}, properties=props,
-                               children=children[:100])
+    resp = _rq.post("https://api.notion.com/v1/pages", headers=headers,
+                    json={"parent": parent, "properties": props,
+                          "children": children[:100]}, timeout=30)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Notion pages.create {resp.status_code}: {resp.text[:400]}")
+    page = resp.json()
     return {"ok": True, "page_id": page.get("id"), "page_url": page.get("url")}
 
 
