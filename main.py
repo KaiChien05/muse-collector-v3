@@ -60,25 +60,45 @@ def extract_with_apify_or_ytdlp(url: str):
         try:
             from apify_client import ApifyClient
             client = ApifyClient(token)
-            actor = {
-                "IG": "apify/instagram-scraper",
-                "Threads": "apify/threads-scraper",
-                "X": "apidojo/twitter-scraper",
-            }.get(platform, "apify/instagram-scraper")
-            run = client.actor(actor).call(run_input={"directUrls": [url], "resultsLimit": 20})
-            items = client.dataset(run["defaultDatasetId"]).list_items().items if run else []
+            if platform == "Threads":
+                # This actor takes post URLs and returns one record whose
+                # nested "thread" object carries username/text/images/videos.
+                actor_id = "logical_scrapers/threads-post-scraper"
+                run_input = {"startUrls": [{"url": url}], "includeReplies": False, "maxReplies": 0}
+            elif platform == "X":
+                actor_id = "apidojo/twitter-scraper"
+                run_input = {"directUrls": [url], "resultsLimit": 20}
+            else:
+                actor_id = "apify/instagram-scraper"
+                run_input = {"directUrls": [url], "resultsLimit": 20}
+            run = client.actor(actor_id).call(run_input=run_input)
+            ds_id = None
+            if isinstance(run, dict):
+                ds_id = run.get("defaultDatasetId") or run.get("default_dataset_id")
+            elif run is not None:
+                ds_id = getattr(run, "default_dataset_id", None) or getattr(run, "defaultDatasetId", None)
+            items = client.dataset(ds_id).list_items().items if ds_id else []
             if items:
                 it = items[0]
+                t = it.get("thread") if isinstance(it.get("thread"), dict) else it
                 media = []
-                for key in ("images", "displayUrl", "videoUrl"):
-                    v = it.get(key)
-                    if isinstance(v, list):
-                        media += [{"url": x} if isinstance(x, str) else x for x in v]
-                    elif isinstance(v, str):
-                        media.append({"url": v})
+                def add_media(v, kind="image"):
+                    if isinstance(v, str):
+                        media.append({"url": v, "kind": kind})
+                    elif isinstance(v, dict):
+                        u = v.get("url") or v.get("displayUrl") or v.get("videoUrl")
+                        if u:
+                            media.append({"url": u, "kind": kind})
+                    elif isinstance(v, list):
+                        for x in v:
+                            add_media(x, kind)
+                for key in ("images", "displayUrl", "childPosts", "media"):
+                    add_media(t.get(key), "image")
+                for key in ("videos", "videoUrl"):
+                    add_media(t.get(key), "video")
                 return {
-                    "author": it.get("ownerUsername") or it.get("username") or it.get("author") or "unknown",
-                    "caption": it.get("caption") or it.get("text") or "",
+                    "author": t.get("username") or t.get("ownerUsername") or t.get("author") or "unknown",
+                    "caption": t.get("text") or t.get("caption") or "",
                     "media": media,
                     "timestamp": None,
                     "source": "apify",
@@ -236,9 +256,28 @@ def save_notion(data, platform, url):
         for i in range(0, min(len(text), 16000), 1900):
             children.append({"object": "block", "type": "paragraph",
                              "paragraph": {"rich_text": [{"type": "text", "text": {"content": text[i:i+1900]}}]}})
+    # All collected media: images as image blocks, videos as link paragraphs
+    seen_media = set()
+    for m in data.get("media", []):
+        if isinstance(m, dict):
+            mu, mkind = m.get("url"), m.get("kind", "image")
+        else:
+            mu, mkind = m, "image"
+        if not mu or mu in seen_media:
+            continue
+        seen_media.add(mu)
+        if mkind == "video":
+            children.append({"object": "block", "type": "paragraph",
+                             "paragraph": {"rich_text": [{"type": "text",
+                                "text": {"content": f"影片：{mu}", "link": {"url": mu}}]}}]}})
+        else:
+            children.append({"object": "block", "type": "image",
+                             "image": {"type": "external", "external": {"url": mu}}})
+        if len(seen_media) >= 20:
+            break
     children.append({"object": "block", "type": "paragraph",
                      "paragraph": {"rich_text": [{"type": "text",
-                        "text": {"content": f"來源：{url}", "link": {"url": url}}}]}})
+                        "text": {"content": f"來源：{url}", "link": {"url": url}}]}}]}})
     resp = _rq.post("https://api.notion.com/v1/pages", headers=headers,
                     json={"parent": parent, "properties": props,
                           "children": children[:100]}, timeout=30)
