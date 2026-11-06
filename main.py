@@ -269,7 +269,7 @@ def save_notion(data, platform, url):
         if mkind == "video":
             children.append({"object": "block", "type": "paragraph",
                              "paragraph": {"rich_text": [{"type": "text",
-                                "text": {"content": f"影片：{mu}", "link": {"url": mu}}]}}]}})
+                                "text": {"content": f"影片：{mu}", "link": {"url": mu}}}]}})
         else:
             children.append({"object": "block", "type": "image",
                              "image": {"type": "external", "external": {"url": mu}}})
@@ -277,7 +277,7 @@ def save_notion(data, platform, url):
             break
     children.append({"object": "block", "type": "paragraph",
                      "paragraph": {"rich_text": [{"type": "text",
-                        "text": {"content": f"來源：{url}", "link": {"url": url}}]}}]}})
+                        "text": {"content": f"來源：{url}", "link": {"url": url}}}]}})
     resp = _rq.post("https://api.notion.com/v1/pages", headers=headers,
                     json={"parent": parent, "properties": props,
                           "children": children[:100]}, timeout=30)
