@@ -1,0 +1,281 @@
+"""
+Muse 貼文截錄器 V3.1 - Notion + Obsidian 雙存
+Fixes over the shipped V3 main.py:
+- Added POST /api/collect-web (was referenced by frontend/automation but missing)
+- /api/collect now accepts destination on social posts; /api/collect-web the same
+- GET / serves frontend.html, GET /api/health for platform health checks
+- CORS enabled so the frontend can call the API
+- Notion write auto-detects the database schema:
+  * V3 English schema (URL/Platform/Author/Caption/PostDate/...)
+  * Existing Kai 收藏庫 Chinese schema (名稱/作者/來源連結/平台/封面/建立時間/標籤/狀態)
+  Full caption/content is also appended as page blocks so nothing is lost
+  when the database has no Caption/FullContent property.
+- Apify path actually calls an actor (was a `pass` placeholder), yt-dlp fallback kept
+- Obsidian REST push now includes the configured folder path, and is verified
+- Optional shared-secret: set COLLECTOR_API_KEY to require header X-API-Key
+"""
+from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel
+from datetime import datetime
+import os, re, pathlib, requests
+from dotenv import load_dotenv
+
+load_dotenv()
+
+app = FastAPI(title="Muse Collector V3.1 - Notion + Obsidian")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+DESTINATIONS = ("notion", "obsidian", "both")
+
+
+class CollectPayload(BaseModel):
+    url: str
+    destination: str = "both"  # notion | obsidian | both
+
+
+def check_key(x_api_key: str | None):
+    expected = os.getenv("COLLECTOR_API_KEY")
+    if expected and x_api_key != expected:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key")
+
+
+def detect_platform(url: str) -> str:
+    l = url.lower()
+    if "instagram.com" in l or "instagr.am" in l:
+        return "IG"
+    if "threads.com" in l or "threads.net" in l:
+        return "Threads"
+    if "x.com" in l or "twitter.com" in l:
+        return "X"
+    return "Web"
+
+
+# ---------- extraction ----------
+def extract_with_apify_or_ytdlp(url: str):
+    platform = detect_platform(url)
+    token = os.getenv("APIFY_TOKEN")
+    if token:
+        try:
+            from apify_client import ApifyClient
+            client = ApifyClient(token)
+            actor = {
+                "IG": "apify/instagram-scraper",
+                "Threads": "apify/threads-scraper",
+                "X": "apidojo/twitter-scraper",
+            }.get(platform, "apify/instagram-scraper")
+            run = client.actor(actor).call(run_input={"directUrls": [url], "resultsLimit": 20})
+            items = client.dataset(run["defaultDatasetId"]).list_items().items if run else []
+            if items:
+                it = items[0]
+                media = []
+                for key in ("images", "displayUrl", "videoUrl"):
+                    v = it.get(key)
+                    if isinstance(v, list):
+                        media += [{"url": x} if isinstance(x, str) else x for x in v]
+                    elif isinstance(v, str):
+                        media.append({"url": v})
+                return {
+                    "author": it.get("ownerUsername") or it.get("username") or it.get("author") or "unknown",
+                    "caption": it.get("caption") or it.get("text") or "",
+                    "media": media,
+                    "timestamp": None,
+                    "source": "apify",
+                }
+        except Exception as e:
+            print(f"Apify failed, fallback yt-dlp: {e}")
+    try:
+        import yt_dlp
+        with yt_dlp.YoutubeDL({"quiet": True, "skip_download": True, "noplaylist": True}) as ydl:
+            info = ydl.extract_info(url, download=False)
+            return {
+                "author": info.get("uploader") or info.get("channel") or "unknown",
+                "caption": info.get("description") or info.get("title") or "",
+                "media": info.get("thumbnails", []),
+                "timestamp": info.get("timestamp"),
+                "source": "yt-dlp",
+            }
+    except Exception as e:
+        return {"author": "unknown", "caption": "", "media": [], "timestamp": None,
+                "source": "none", "error": str(e)}
+
+
+def extract_web(url: str):
+    try:
+        import trafilatura
+        from bs4 import BeautifulSoup
+        downloaded = trafilatura.fetch_url(url)
+        main_text = trafilatura.extract(downloaded) if downloaded else ""
+        r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        title = (soup.title.string or "").strip() if soup.title and soup.title.string else ""
+        og = soup.find("meta", property="og:image")
+        og_image = og.get("content", "") if og else ""
+        dtag = soup.find("meta", attrs={"name": "description"}) or soup.find("meta", property="og:description")
+        desc = dtag.get("content", "") if dtag else ""
+        images = [img.get("src") for img in soup.find_all("img") if img.get("src")][:10]
+        return {"title": title, "description": desc, "og_image": og_image,
+                "content": main_text or "", "images": images,
+                "domain": re.sub(r"https?://", "", url).split("/")[0],
+                "author": title, "caption": desc}
+    except Exception as e:
+        return {"title": "", "description": "", "og_image": "", "content": "",
+                "images": [], "domain": "", "error": str(e)}
+
+
+# ---------- Obsidian ----------
+def generate_obsidian_markdown(data: dict, platform: str, url: str):
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    safe_author = re.sub(r"[^a-zA-Z0-9_-]", "", str(data.get("author", "unknown")))[:20] or "unknown"
+    filename = f"{date_str}-{platform}-{safe_author}.md"
+    fm = (f"---\nsource: {url}\nplatform: {platform}\n"
+          f"author: {data.get('author', '')}\ndate: {date_str}\n"
+          f"tags: [clippings, {platform.lower()}]\ndomain: {data.get('domain', '')}\n---\n\n")
+    body = f"# {data.get('title') or data.get('author') or platform}\n\n{(data.get('caption') or data.get('content', ''))[:8000]}\n\n"
+    media = [m.get("url") if isinstance(m, dict) else m for m in data.get("media", [])]
+    for u in [x for x in media if x][:10] + list(data.get("images", []))[:10]:
+        body += f"![image]({u})\n\n"
+    if data.get("og_image"):
+        body += f"![image]({data['og_image']})\n\n"
+    return filename, fm + body
+
+
+def save_obsidian(data, platform, url):
+    fname, md = generate_obsidian_markdown(data, platform, url)
+    folder = os.getenv("OBSIDIAN_FOLDER", "Clippings/Social").strip("/")
+    api_url = os.getenv("OBSIDIAN_API_URL")
+    api_token = os.getenv("OBSIDIAN_API_TOKEN")
+    if api_url and api_token:
+        target = f"{folder}/{fname}" if folder else fname
+        resp = requests.put(f"{api_url.rstrip('/')}/vault/{target}",
+                            data=md.encode("utf-8"),
+                            headers={"Authorization": f"Bearer {api_token}"}, timeout=20)
+        resp.raise_for_status()
+        return f"pushed via REST API as {target}"
+    out_path = pathlib.Path("/tmp") / fname
+    out_path.write_text(md, encoding="utf-8")
+    return {"note": f"generated {fname} at {out_path} (no OBSIDIAN_API_URL set; file is ephemeral on the host)",
+            "filename": fname, "obsidian_markdown": md[:8000]}
+
+
+# ---------- Notion ----------
+def save_notion(data, platform, url):
+    from notion_client import Client
+    notion = Client(auth=os.getenv("NOTION_TOKEN"))
+    db_id = os.getenv("NOTION_DATABASE_ID")
+    if not db_id:
+        raise RuntimeError("NOTION_DATABASE_ID not set")
+    schema = notion.databases.retrieve(database_id=db_id).get("properties", {})
+    names = set(schema.keys())
+    text = (data.get("caption") or data.get("content") or data.get("description") or "")
+    title_text = (data.get("title") or text or url)[:200]
+    cover_url = data.get("og_image") or next(
+        (m.get("url") for m in data.get("media", []) if isinstance(m, dict) and m.get("url")), None)
+    props = {}
+    now_iso = datetime.now().isoformat()
+    if "URL" in names:  # V3 English schema
+        props["URL"] = {"title": [{"text": {"content": url}}]}
+        if "Platform" in names:
+            props["Platform"] = {"select": {"name": platform}}
+        if "Author" in names:
+            props["Author"] = {"rich_text": [{"text": {"content": str(data.get("author", ""))[:1900]}}]}
+        if "Caption" in names:
+            props["Caption"] = {"rich_text": [{"text": {"content": text[:1900]}}]}
+        if "Domain" in names and data.get("domain"):
+            props["Domain"] = {"rich_text": [{"text": {"content": data["domain"][:1900]}}]}
+        if "FullContent" in names and data.get("content"):
+            props["FullContent"] = {"rich_text": [{"text": {"content": data["content"][:1900]}}]}
+        if "PostDate" in names:
+            props["PostDate"] = {"date": {"start": now_iso}}
+    elif "名稱" in names:  # Existing Kai 收藏庫 schema
+        props["名稱"] = {"title": [{"text": {"content": title_text}}]}
+        if "作者" in names:
+            props["作者"] = {"rich_text": [{"text": {"content": str(data.get("author", ""))[:1900]}}]}
+        if "來源連結" in names:
+            props["來源連結"] = {"url": url}
+        if "平台" in names:
+            plat_map = {"IG": "instagram", "Threads": "threads"}
+            if platform in plat_map:  # X / Web options don't exist in that DB; skip instead of failing
+                props["平台"] = {"select": {"name": plat_map[platform]}}
+        if "封面" in names and cover_url:
+            props["封面"] = {"files": [{"name": "cover", "external": {"url": cover_url}}]}
+        if "建立時間" in names:
+            props["建立時間"] = {"date": {"start": now_iso}}
+        if "狀態" in names:
+            props["狀態"] = {"select": {"name": "未整理"}}
+        if "標籤" in names:
+            props["標籤"] = {"multi_select": [{"name": "收藏"}]}
+    else:
+        raise RuntimeError(f"Unrecognised Notion schema: {sorted(names)}")
+    # Full text as page blocks (Notion rich_text props cap at 2000 chars)
+    children = []
+    if text:
+        for i in range(0, min(len(text), 16000), 1900):
+            children.append({"object": "block", "type": "paragraph",
+                             "paragraph": {"rich_text": [{"type": "text", "text": {"content": text[i:i+1900]}}]}})
+    children.append({"object": "block", "type": "paragraph",
+                     "paragraph": {"rich_text": [{"type": "text",
+                        "text": {"content": f"來源：{url}", "link": {"url": url}}}]}})
+    page = notion.pages.create(parent={"database_id": db_id}, properties=props,
+                               children=children[:100])
+    return {"ok": True, "page_id": page.get("id"), "page_url": page.get("url")}
+
+
+# ---------- shared collect flow ----------
+def run_collect(url: str, destination: str, force_platform: str | None = None):
+    if destination not in DESTINATIONS:
+        raise HTTPException(status_code=400, detail=f"destination must be one of {DESTINATIONS}")
+    platform = force_platform or detect_platform(url)
+    data = extract_web(url) if platform == "Web" else extract_with_apify_or_ytdlp(url)
+    data["platform"] = platform
+    data["url"] = url
+    results = {}
+    if destination in ("notion", "both"):
+        try:
+            results["notion"] = save_notion(data, platform, url)
+        except Exception as e:
+            results["notion"] = f"error: {e}"
+    if destination in ("obsidian", "both"):
+        try:
+            results["obsidian"] = save_obsidian(data, platform, url)
+        except Exception as e:
+            results["obsidian"] = f"error: {e}"
+    preview = {k: str(v)[:500] for k, v in data.items()}
+    return {"ok": True, "platform": platform, "destination": destination,
+            "results": results, "data": preview}
+
+
+@app.get("/api/health")
+def health():
+    return {"status": "ok", "service": "Muse Collector V3.1",
+            "notion_configured": bool(os.getenv("NOTION_TOKEN") and os.getenv("NOTION_DATABASE_ID")),
+            "apify_configured": bool(os.getenv("APIFY_TOKEN")),
+            "obsidian_api_configured": bool(os.getenv("OBSIDIAN_API_URL") and os.getenv("OBSIDIAN_API_TOKEN"))}
+
+
+@app.post("/api/collect")
+def collect(payload: CollectPayload, x_api_key: str | None = Header(default=None)):
+    check_key(x_api_key)
+    return run_collect(payload.url, payload.destination)
+
+
+@app.post("/api/collect-web")
+def collect_web(payload: CollectPayload, x_api_key: str | None = Header(default=None)):
+    check_key(x_api_key)
+    return run_collect(payload.url, payload.destination, force_platform="Web")
+
+
+@app.get("/app")
+def frontend():
+    p = pathlib.Path(__file__).parent / "frontend.html"
+    if p.exists():
+        return FileResponse(p)
+    return JSONResponse({"detail": "frontend.html not found"}, status_code=404)
+
+
+@app.get("/")
+def root():
+    return {"status": "Muse Collector V3.1 - Notion + Obsidian ready",
+            "endpoints": ["/api/health", "/api/collect", "/api/collect-web", "/app"]}

@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+python-dotenv
+notion-client
+apify-client
+yt-dlp
+trafilatura
+beautifulsoup4
+requests

@@ -1,0 +1,22 @@
+# Render Blueprint - Free web service (512MB RAM, spins down after 15 min idle)
+services:
+  - type: web
+    name: muse-collector-v3
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    region: singapore
+    healthCheckPath: /api/health
+    envVars:
+      - key: NOTION_TOKEN
+        sync: false
+      - key: NOTION_DATABASE_ID
+        sync: false
+      - key: APIFY_TOKEN
+        sync: false
+      - key: OBSIDIAN_API_URL
+        sync: false
+      - key: OBSIDIAN_API_TOKEN
+        sync: false
+      - key: COLLECTOR_API_KEY
+        generateValue: true
