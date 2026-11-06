@@ -254,6 +254,17 @@ def health():
             "apify_configured": bool(os.getenv("APIFY_TOKEN")),
             "obsidian_api_configured": bool(os.getenv("OBSIDIAN_API_URL") and os.getenv("OBSIDIAN_API_TOKEN"))}
 
+@app.get("/api/key-check")
+def key_check(x_api_key: str | None = Header(default=None)):
+     import hashlib
+     expected = os.getenv("COLLECTOR_API_KEY") or ""
+     received = x_api_key or ""
+     def fp(s):
+              return hashlib.sha256(s.encode()).hexdigest()[:8] if s else None
+          return {"received_present": bool(received), "received_len": len(received),
+                          "expected_len": len(expected), "match": bool(expected) and received == expected,
+                  "received_fp": fp(received), "expected_fp": fp(expected)}
+
 
 @app.post("/api/collect")
 def collect(payload: CollectPayload, x_api_key: str | None = Header(default=None)):
