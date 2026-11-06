@@ -21,6 +21,7 @@ from pydantic import BaseModel
 from datetime import datetime, timezone, timedelta
 _TW = timezone(timedelta(hours=8))
 import os, re, pathlib, requests
+_re_num = re.compile(r"^\d+[.)]\s+")
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -34,6 +35,7 @@ DESTINATIONS = ("notion", "obsidian", "both")
 class CollectPayload(BaseModel):
     url: str
     destination: str = "both"  # notion | obsidian | both
+    summary: str | None = None  # optional notes (## heading / 1. list / text) placed at top of the Notion page
 
 
 def check_key(x_api_key: str | None):
@@ -408,6 +410,20 @@ def save_notion(data, platform, url):
                 out.append({"object": "block", "type": kind, kind: {"rich_text": _rt(chunk[i:i+1900])}})
         return out
     children = []
+    for line in (data.get("summary") or "").splitlines():
+        line = line.rstrip()
+        if not line.strip():
+            continue
+        if line.startswith("## "):
+            children.append(_h(line[3:].strip()))
+        elif line.startswith("- "):
+            children.append({"object": "block", "type": "bulleted_list_item",
+                             "bulleted_list_item": {"rich_text": _rt(line[2:].strip())}})
+        elif _re_num.match(line):
+            children.append({"object": "block", "type": "numbered_list_item",
+                             "numbered_list_item": {"rich_text": _rt(_re_num.sub("", line, 1).strip())}})
+        else:
+            children.append({"object": "block", "type": "paragraph", "paragraph": {"rich_text": _rt(line)}})
     main_text, quoted = text, []
     if "—— 引用 @" in text:
         parts = text.split("—— 引用 @")
@@ -456,7 +472,7 @@ def save_notion(data, platform, url):
 
 
 # ---------- shared collect flow ----------
-def run_collect(url: str, destination: str, force_platform: str | None = None):
+def run_collect(url: str, destination: str, force_platform: str | None = None, summary: str | None = None):
     if destination not in DESTINATIONS:
         raise HTTPException(status_code=400, detail=f"destination must be one of {DESTINATIONS}")
     platform = force_platform or detect_platform(url)
@@ -472,6 +488,8 @@ def run_collect(url: str, destination: str, force_platform: str | None = None):
             print(f"Threads HTML parse failed: {e}")
     data["platform"] = platform
     data["url"] = url
+    if summary:
+        data["summary"] = summary
     results = {}
     if destination in ("notion", "both"):
         try:
@@ -510,13 +528,13 @@ def key_check(x_api_key: str | None = Header(default=None)):
 @app.post("/api/collect")
 def collect(payload: CollectPayload, x_api_key: str | None = Header(default=None)):
     check_key(x_api_key)
-    return run_collect(payload.url, payload.destination)
+    return run_collect(payload.url, payload.destination, summary=payload.summary)
 
 
 @app.post("/api/collect-web")
 def collect_web(payload: CollectPayload, x_api_key: str | None = Header(default=None)):
     check_key(x_api_key)
-    return run_collect(payload.url, payload.destination, force_platform="Web")
+    return run_collect(payload.url, payload.destination, force_platform="Web", summary=payload.summary)
 
 
 @app.get("/app")
